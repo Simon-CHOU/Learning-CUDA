@@ -1,50 +1,459 @@
+#include <algorithm>  // 使用 std::min 计算对角线长度
+#include <cmath>  // 使用 exp/expf/rsqrtf/INFINITY 等数学函数
+#include <type_traits>  // 使用 std::is_same 进行类型分发
 #include <vector>
 #include <common/maca_fp16.h>
 
 #include "../tester/utils.h"
 
-/**
- * @brief Computes the trace of a matrix.
- *
- * The trace of a matrix is defined as the sum of its diagonal elements.
- * This function expects a flattened row-major matrix stored in a
- * std::vector. If the matrix is not square, the trace will sum up
- * elements along the main diagonal up to the smaller of rows or cols.
- *
- * @tparam T The numeric type of matrix elements (e.g., float, int).
- * @param h_input A flattened matrix of size rows * cols.
- * @param rows Number of rows in the matrix.
- * @param cols Number of columns in the matrix.
- * @return The trace (sum of diagonal values) of the matrix.
- */
-template <typename T>
-T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
-  // TODO: Implement the trace function
-  return T(-1);
+#define CHECK_MACA(call) RUNTIME_CHECK(call)  // 统一封装沐曦运行时错误检查
+
+////////// 作业题1 沐曦START//////////  // 标注作业题1的沐曦适配代码开始
+template <typename T>  // 模板支持 int/float 两种类型
+__global__ void trace_kernel(const T* input, T* output, size_t rows, size_t cols, size_t n) {  // GPU Kernel 计算 trace
+  size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;  // 计算全局线程索引
+  size_t stride = static_cast<size_t>(blockDim.x) * gridDim.x;  // 计算跨步用于 grid-stride 循环
+  T local_sum = 0;  // 线程私有局部累加
+  for (size_t i = idx; i < n; i += stride) {  // 遍历对角线元素索引
+    local_sum += input[i * cols + i];  // 访问主对角线元素并累加
+  }
+  if (local_sum != 0) {  // 仅在非零时进行原子加
+    atomicAdd(output, local_sum);  // 将局部累加写入全局输出
+  }
 }
 
-/**
- * @brief Computes flash attention for given query, key, and value tensors.
- * 
- * @tparam T Data type (float) for input/output tensors
- * @param[in] h_q Query tensor of shape [batch_size, tgt_seq_len, query_heads, head_dim]
- * @param[in] h_k Key tensor of shape [batch_size, src_seq_len, kv_heads, head_dim]
- * @param[in] h_v Value tensor of shape [batch_size, src_seq_len, kv_heads, head_dim]
- * @param[out] h_o Output attention tensor of shape [batch_size, tgt_seq_len, query_heads, head_dim]
- * @param[in] batch_size Batch dimension size
- * @param[in] target_seq_len Target sequence length
- * @param[in] src_seq_len Source sequence length  
- * @param[in] query_heads Number of query attention heads
- * @param[in] kv_heads Number of key/value heads (supports grouped query attention)
- * @param[in] head_dim Dimension size of each attention head
- * @param[in] is_causal Whether to apply causal masking
- */
-template <typename T>
-void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
-                    const std::vector<T>& h_v, std::vector<T>& h_o,
-                    int batch_size, int target_seq_len, int src_seq_len, 
-                    int query_heads, int kv_heads, int head_dim, bool is_causal) {       
+template <typename T>  // 模板支持 int/float 两种类型
+T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {  // 计算矩阵的迹
+  size_t n = std::min(rows, cols);  // 计算对角线长度
+  if (n == 0) {  // 处理空矩阵边界情况
+    return T(0);  // 空矩阵迹为 0
+  }
+
+  T* d_input = nullptr;  // 设备端输入指针
+  T* d_output = nullptr;  // 设备端输出指针
+  size_t input_size = h_input.size() * sizeof(T);  // 输入数据字节数
+  size_t output_size = sizeof(T);  // 输出数据字节数
+
+  CHECK_MACA(mcMalloc(reinterpret_cast<void**>(&d_input), input_size));  // 分配设备输入内存
+  CHECK_MACA(mcMalloc(reinterpret_cast<void**>(&d_output), output_size));  // 分配设备输出内存
+
+  CHECK_MACA(mcMemcpy(d_input, h_input.data(), input_size, mcMemcpyHostToDevice));  // 拷贝输入到设备
+  CHECK_MACA(mcMemset(d_output, 0, output_size));  // 初始化输出为 0
+
+  int block_size = 256;  // 每个 block 的线程数
+  int grid_size = static_cast<int>((n + block_size - 1) / block_size);  // 计算 grid 数量
+  if (grid_size > 1024) {  // 限制 grid 规模避免过大
+    grid_size = 1024;  // 限制最大 grid 数
+  }
+
+  trace_kernel<<<grid_size, block_size>>>(d_input, d_output, rows, cols, n);  // 启动 trace kernel
+  CHECK_MACA(mcGetLastError());  // 检查 kernel 启动错误
+  CHECK_MACA(mcDeviceSynchronize());  // 同步等待 kernel 完成
+
+  T result = 0;  // 主机端结果
+  CHECK_MACA(mcMemcpy(&result, d_output, output_size, mcMemcpyDeviceToHost));  // 拷贝结果回主机
+
+  CHECK_MACA(mcFree(d_input));  // 释放设备输入内存
+  CHECK_MACA(mcFree(d_output));  // 释放设备输出内存
+
+  return result;  // 返回 trace 结果
 }
+////////// 作业题1 沐曦 END //////////  // 标注作业题1的沐曦适配代码结束
+
+////////// 作业题2 沐曦START//////////  // 标注作业题2的沐曦适配代码开始
+template <typename T>  // 模板支持 float/half 两种类型
+__device__ T warpReduceSum(T val) {  // Warp 内归约求和
+  for (int offset = warpSize / 2; offset > 0; offset /= 2) {  // 按照 warp 规约步长迭代
+    val += __shfl_down_sync(0xffffffff, val, offset);  // 使用 shuffle 指令累加
+  }
+  return val;  // 返回 warp 内归约结果
+}
+
+template <typename T>  // 模板支持 float/half 两种类型
+__device__ T blockReduceSum(T val) {  // Block 内归约求和
+  static __shared__ T shared[32];  // 保存每个 warp 的归约结果
+  int lane = threadIdx.x % warpSize;  // 计算线程在 warp 内的 lane
+  int wid = threadIdx.x / warpSize;  // 计算线程所属的 warp id
+
+  val = warpReduceSum(val);  // 先在 warp 内归约
+  if (lane == 0) {  // 仅每个 warp 的 lane0 写共享内存
+    shared[wid] = val;  // 写入该 warp 的部分和
+  }
+  __syncthreads();  // 等待所有 warp 写入
+
+  val = (threadIdx.x < blockDim.x / warpSize) ? shared[lane] : T(0);  // 由第一个 warp 读取共享内存
+  if (wid == 0) {  // 仅第一个 warp 执行最终归约
+    val = warpReduceSum(val);  // 最终归约得到 block 和
+  }
+  return val;  // 返回 block 归约结果
+}
+
+__global__ void flash_attention_kernel_float(  // float 专用 kernel 对齐参考实现
+    const float* __restrict__ Q,  // Query 指针
+    const float* __restrict__ K,  // Key 指针
+    const float* __restrict__ V,  // Value 指针
+    float* __restrict__ O,  // Output 指针
+    int tgt_len, int src_len,  // 序列长度参数
+    int q_heads, int kv_heads, int head_dim,  // 头数与维度参数
+    bool is_causal) {  // 是否使用 causal mask
+  int t_idx = blockIdx.x;  // target 序列索引
+  int h_idx = blockIdx.y;  // query head 索引
+  int b_idx = blockIdx.z;  // batch 索引
+  int d_idx = threadIdx.x;  // head_dim 内的线程索引
+
+  int kv_h_idx = (h_idx * kv_heads) / q_heads;  // GQA 映射得到 kv head
+
+  size_t q_offset = static_cast<size_t>(b_idx) * tgt_len * q_heads * head_dim +  // 计算 Q 的基地址
+                    static_cast<size_t>(t_idx) * q_heads * head_dim +  // 累加 target 偏移
+                    static_cast<size_t>(h_idx) * head_dim;  // 累加 head 偏移
+  size_t o_offset = q_offset;  // 输出与 Q 对齐
+
+  size_t k_base_offset = static_cast<size_t>(b_idx) * src_len * kv_heads * head_dim +  // 计算 K 的基地址
+                         static_cast<size_t>(kv_h_idx) * head_dim;  // 累加 kv head 偏移
+  size_t v_base_offset = k_base_offset;  // V 与 K 对齐
+
+  float o_accum = 0.0f;  // 输出累加器
+
+  __shared__ float shared_max;  // 保存最大 score
+  __shared__ float shared_score;  // 保存当前 score
+  __shared__ float shared_denom;  // 保存分母和
+  __shared__ float shared_weight;  // 保存权重
+
+  float scale = rsqrtf(static_cast<float>(head_dim));  // 计算缩放因子
+
+  if (threadIdx.x == 0) {  // 仅线程 0 初始化 max
+    shared_max = -INFINITY;  // 初始化为负无穷
+  }
+  __syncthreads();  // 同步保证初始化完成
+
+  for (int s_idx = 0; s_idx < src_len; ++s_idx) {  // 遍历 source 序列
+    if (is_causal && s_idx > t_idx) {  // causal mask 过滤上三角
+      continue;  // 跳过被 mask 的位置
+    }
+    if (threadIdx.x == 0) {  // 仅线程 0 做串行点积
+      float dot = 0.0f;  // 点积累加器
+      size_t k_ptr = k_base_offset + static_cast<size_t>(s_idx) * kv_heads * head_dim;  // 计算 K 指针
+      for (int i = 0; i < head_dim; ++i) {  // 遍历 head_dim
+        dot += Q[q_offset + i] * K[k_ptr + i];  // 累加点积
+      }
+      dot *= scale;  // 进行缩放
+      shared_score = dot;  // 保存 score
+      if (dot > shared_max) {  // 更新 max
+        shared_max = dot;  // 写入更大的 max
+      }
+    }
+    __syncthreads();  // 同步确保 max 更新
+  }
+
+  float m_max = shared_max;  // 读取 max 到寄存器
+
+  if (threadIdx.x == 0) {  // 仅线程 0 初始化 denom
+    shared_denom = 0.0f;  // 初始化分母和
+  }
+  __syncthreads();  // 同步确保初始化完成
+
+  for (int s_idx = 0; s_idx < src_len; ++s_idx) {  // 遍历 source 序列
+    if (is_causal && s_idx > t_idx) {  // causal mask 过滤上三角
+      continue;  // 跳过被 mask 的位置
+    }
+    if (threadIdx.x == 0) {  // 仅线程 0 做串行点积
+      float dot = 0.0f;  // 点积累加器
+      size_t k_ptr = k_base_offset + static_cast<size_t>(s_idx) * kv_heads * head_dim;  // 计算 K 指针
+      for (int i = 0; i < head_dim; ++i) {  // 遍历 head_dim
+        dot += Q[q_offset + i] * K[k_ptr + i];  // 累加点积
+      }
+      dot *= scale;  // 进行缩放
+      shared_score = dot;  // 保存 score
+      float w = expf(dot - m_max);  // 计算 softmax 权重
+      shared_weight = w;  // 保存权重
+      shared_denom += w;  // 累加分母
+    }
+    __syncthreads();  // 同步确保权重准备好
+
+    float w = shared_weight;  // 读取权重
+    if (d_idx < head_dim) {  // head_dim 内线程参与输出
+      size_t v_ptr = v_base_offset + static_cast<size_t>(s_idx) * kv_heads * head_dim + d_idx;  // 计算 V 指针
+      o_accum += V[v_ptr] * w;  // 累加加权 Value
+    }
+    __syncthreads();  // 同步保证本轮完成
+  }
+
+  float denom = shared_denom;  // 读取分母
+  if (d_idx < head_dim) {  // head_dim 内线程写结果
+    O[o_offset + d_idx] = (denom > 0.0f) ? (o_accum / denom) : 0.0f;  // 写入归一化结果
+  }
+}
+
+__global__ void flash_attention_kernel_half(  // half 专用 kernel 使用串行点积
+    const half* __restrict__ Q,  // Query 指针
+    const half* __restrict__ K,  // Key 指针
+    const half* __restrict__ V,  // Value 指针
+    half* __restrict__ O,  // Output 指针
+    int tgt_len, int src_len,  // 序列长度参数
+    int q_heads, int kv_heads, int head_dim,  // 头数与维度参数
+    bool is_causal) {  // 是否使用 causal mask
+  int t_idx = blockIdx.x;  // target 序列索引
+  int h_idx = blockIdx.y;  // query head 索引
+  int b_idx = blockIdx.z;  // batch 索引
+  int d_idx = threadIdx.x;  // head_dim 内的线程索引
+
+  int kv_h_idx = (h_idx * kv_heads) / q_heads;  // GQA 映射得到 kv head
+
+  size_t q_offset = static_cast<size_t>(b_idx) * tgt_len * q_heads * head_dim +  // 计算 Q 的基地址
+                    static_cast<size_t>(t_idx) * q_heads * head_dim +  // 累加 target 偏移
+                    static_cast<size_t>(h_idx) * head_dim;  // 累加 head 偏移
+  size_t o_offset = q_offset;  // 输出与 Q 对齐
+
+  size_t k_base_offset = static_cast<size_t>(b_idx) * src_len * kv_heads * head_dim +  // 计算 K 的基地址
+                         static_cast<size_t>(kv_h_idx) * head_dim;  // 累加 kv head 偏移
+  size_t v_base_offset = k_base_offset;  // V 与 K 对齐
+
+  float o_accum = 0.0f;  // 输出累加器
+
+  __shared__ float shared_max;  // 保存最大 score
+  __shared__ float shared_score;  // 保存当前 score
+  __shared__ float shared_denom;  // 保存分母和
+  __shared__ float shared_weight;  // 保存权重
+
+  float scale = rsqrtf(static_cast<float>(head_dim));  // 计算缩放因子
+
+  if (threadIdx.x == 0) {  // 仅线程 0 初始化 max
+    shared_max = -INFINITY;  // 初始化为负无穷
+  }
+  __syncthreads();  // 同步保证初始化完成
+
+  for (int s_idx = 0; s_idx < src_len; ++s_idx) {  // 遍历 source 序列
+    if (is_causal && s_idx > t_idx) {  // causal mask 过滤上三角
+      continue;  // 跳过被 mask 的位置
+    }
+    if (threadIdx.x == 0) {  // 仅线程 0 做串行点积
+      float dot = 0.0f;  // 点积累加器
+      size_t k_ptr = k_base_offset + static_cast<size_t>(s_idx) * kv_heads * head_dim;  // 计算 K 指针
+      for (int i = 0; i < head_dim; ++i) {  // 遍历 head_dim
+        float q_val = static_cast<float>(Q[q_offset + i]);  // 读取 Q 并转换为 float
+        float k_val = static_cast<float>(K[k_ptr + i]);  // 读取 K 并转换为 float
+        dot += q_val * k_val;  // 累加点积
+      }
+      dot *= scale;  // 进行缩放
+      shared_score = dot;  // 保存 score
+      if (dot > shared_max) {  // 更新 max
+        shared_max = dot;  // 写入更大的 max
+      }
+    }
+    __syncthreads();  // 同步确保 max 更新
+  }
+
+  float m_max = shared_max;  // 读取 max 到寄存器
+
+  if (threadIdx.x == 0) {  // 仅线程 0 初始化 denom
+    shared_denom = 0.0f;  // 初始化分母和
+  }
+  __syncthreads();  // 同步确保初始化完成
+
+  for (int s_idx = 0; s_idx < src_len; ++s_idx) {  // 遍历 source 序列
+    if (is_causal && s_idx > t_idx) {  // causal mask 过滤上三角
+      continue;  // 跳过被 mask 的位置
+    }
+    if (threadIdx.x == 0) {  // 仅线程 0 做串行点积
+      float dot = 0.0f;  // 点积累加器
+      size_t k_ptr = k_base_offset + static_cast<size_t>(s_idx) * kv_heads * head_dim;  // 计算 K 指针
+      for (int i = 0; i < head_dim; ++i) {  // 遍历 head_dim
+        float q_val = static_cast<float>(Q[q_offset + i]);  // 读取 Q 并转换为 float
+        float k_val = static_cast<float>(K[k_ptr + i]);  // 读取 K 并转换为 float
+        dot += q_val * k_val;  // 累加点积
+      }
+      dot *= scale;  // 进行缩放
+      shared_score = dot;  // 保存 score
+      float w = expf(dot - m_max);  // 计算 softmax 权重
+      shared_weight = w;  // 保存权重
+      shared_denom += w;  // 累加分母
+    }
+    __syncthreads();  // 同步确保权重准备好
+
+    float w = shared_weight;  // 读取权重
+    if (d_idx < head_dim) {  // head_dim 内线程参与输出
+      size_t v_ptr = v_base_offset + static_cast<size_t>(s_idx) * kv_heads * head_dim + d_idx;  // 计算 V 指针
+      float v_val = static_cast<float>(V[v_ptr]);  // 读取 V 并转换为 float
+      o_accum += v_val * w;  // 累加加权 Value
+    }
+    __syncthreads();  // 同步保证本轮完成
+  }
+
+  float denom = shared_denom;  // 读取分母
+  if (d_idx < head_dim) {  // head_dim 内线程写结果
+    float out_val = (denom > 0.0f) ? (o_accum / denom) : 0.0f;  // 计算归一化结果
+    O[o_offset + d_idx] = static_cast<half>(out_val);  // 写入输出并转换为 half
+  }
+}
+
+template <typename T>  // 模板支持 float/half 两种类型
+__global__ void flash_attention_kernel(  // 通用 kernel 使用并行归约
+    const T* __restrict__ Q,  // Query 指针
+    const T* __restrict__ K,  // Key 指针
+    const T* __restrict__ V,  // Value 指针
+    T* __restrict__ O,  // Output 指针
+    int tgt_len, int src_len,  // 序列长度参数
+    int q_heads, int kv_heads, int head_dim,  // 头数与维度参数
+    bool is_causal) {  // 是否使用 causal mask
+  using AccT = double;  // 使用 double 进行高精度累加
+
+  int t_idx = blockIdx.x;  // target 序列索引
+  int h_idx = blockIdx.y;  // query head 索引
+  int b_idx = blockIdx.z;  // batch 索引
+  int d_idx = threadIdx.x;  // head_dim 内的线程索引
+
+  int kv_h_idx = (h_idx * kv_heads) / q_heads;  // GQA 映射得到 kv head
+
+  size_t q_offset = static_cast<size_t>(b_idx) * tgt_len * q_heads * head_dim +  // 计算 Q 的基地址
+                    static_cast<size_t>(t_idx) * q_heads * head_dim +  // 累加 target 偏移
+                    static_cast<size_t>(h_idx) * head_dim;  // 累加 head 偏移
+  size_t o_offset = q_offset;  // 输出与 Q 对齐
+
+  size_t k_base_offset = static_cast<size_t>(b_idx) * src_len * kv_heads * head_dim +  // 计算 K 的基地址
+                         static_cast<size_t>(kv_h_idx) * head_dim;  // 累加 kv head 偏移
+  size_t v_base_offset = k_base_offset;  // V 与 K 对齐
+
+  AccT q_val = 0.0;  // 当前线程对应的 Q 值
+  if (d_idx < head_dim) {  // 仅 head_dim 内线程读取
+    q_val = static_cast<AccT>(Q[q_offset + d_idx]);  // 读取 Q
+  }
+
+  AccT scale = static_cast<AccT>(rsqrtf(static_cast<float>(head_dim)));  // 计算缩放因子
+
+  AccT m_max = -INFINITY;  // 初始化最大 score
+  for (int s_idx = 0; s_idx < src_len; ++s_idx) {  // 遍历 source 序列
+    if (is_causal && s_idx > t_idx) {  // causal mask 过滤上三角
+      continue;  // 跳过被 mask 的位置
+    }
+    AccT k_val = 0.0;  // 当前线程对应的 K 值
+    if (d_idx < head_dim) {  // 仅 head_dim 内线程读取
+      size_t k_ptr = k_base_offset + static_cast<size_t>(s_idx) * kv_heads * head_dim + d_idx;  // 计算 K 指针
+      k_val = static_cast<AccT>(K[k_ptr]);  // 读取 K
+    }
+    AccT dot_frag = q_val * k_val;  // 计算点积片段
+    AccT score = blockReduceSum(dot_frag);  // block 内归约得到点积
+    if (threadIdx.x == 0) {  // 仅线程 0 更新 max
+      score *= scale;  // 进行缩放
+      if (score > m_max) {  // 更新最大值
+        m_max = score;  // 写入更大的 max
+      }
+    }
+  }
+
+  __shared__ AccT shared_max;  // 共享内存保存 max
+  if (threadIdx.x == 0) {  // 仅线程 0 写共享内存
+    shared_max = m_max;  // 写入 max
+  }
+  __syncthreads();  // 同步确保 max 可见
+  m_max = shared_max;  // 广播 max
+
+  AccT d_sum = 0.0;  // 分母累加器
+  AccT o_accum = 0.0;  // 输出累加器
+  for (int s_idx = 0; s_idx < src_len; ++s_idx) {  // 遍历 source 序列
+    if (is_causal && s_idx > t_idx) {  // causal mask 过滤上三角
+      continue;  // 跳过被 mask 的位置
+    }
+    AccT k_val = 0.0;  // 当前线程对应的 K 值
+    if (d_idx < head_dim) {  // 仅 head_dim 内线程读取
+      size_t k_ptr = k_base_offset + static_cast<size_t>(s_idx) * kv_heads * head_dim + d_idx;  // 计算 K 指针
+      k_val = static_cast<AccT>(K[k_ptr]);  // 读取 K
+    }
+    AccT dot_frag = q_val * k_val;  // 计算点积片段
+    AccT score = blockReduceSum(dot_frag);  // block 内归约得到点积
+    __shared__ AccT shared_score;  // 共享内存保存 score
+    if (threadIdx.x == 0) {  // 仅线程 0 写共享内存
+      shared_score = score * scale;  // 写入缩放后的 score
+    }
+    __syncthreads();  // 同步确保 score 可见
+    score = shared_score;  // 广播 score
+
+    AccT exp_score = exp(score - m_max);  // 计算 exp(score - max)
+    d_sum += exp_score;  // 累加分母
+
+    AccT v_val = 0.0;  // 当前线程对应的 V 值
+    if (d_idx < head_dim) {  // 仅 head_dim 内线程读取
+      size_t v_ptr = v_base_offset + static_cast<size_t>(s_idx) * kv_heads * head_dim + d_idx;  // 计算 V 指针
+      v_val = static_cast<AccT>(V[v_ptr]);  // 读取 V
+    }
+    o_accum += v_val * exp_score;  // 累加输出
+  }
+
+  if (d_idx < head_dim) {  // head_dim 内线程写结果
+    AccT result = (d_sum > 0.0) ? (o_accum / d_sum) : 0.0;  // 归一化输出
+    O[o_offset + d_idx] = static_cast<T>(result);  // 写入输出
+  }
+}
+
+template <typename T>  // 模板支持 float/half 两种类型
+void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,  // Flash Attention 主机端入口
+                    const std::vector<T>& h_v, std::vector<T>& h_o,  // 输入输出张量
+                    int batch_size, int target_seq_len, int src_seq_len,  // 维度参数
+                    int query_heads, int kv_heads, int head_dim, bool is_causal) {  // 头数与 causal 标志
+  size_t q_size = h_q.size() * sizeof(T);  // 计算 Q 字节数
+  size_t k_size = h_k.size() * sizeof(T);  // 计算 K 字节数
+  size_t v_size = h_v.size() * sizeof(T);  // 计算 V 字节数
+  size_t o_size = h_o.size() * sizeof(T);  // 计算 O 字节数
+
+  T* d_q = nullptr;  // 设备端 Q 指针
+  T* d_k = nullptr;  // 设备端 K 指针
+  T* d_v = nullptr;  // 设备端 V 指针
+  T* d_o = nullptr;  // 设备端 O 指针
+
+  CHECK_MACA(mcMalloc(reinterpret_cast<void**>(&d_q), q_size));  // 分配 Q 设备内存
+  CHECK_MACA(mcMalloc(reinterpret_cast<void**>(&d_k), k_size));  // 分配 K 设备内存
+  CHECK_MACA(mcMalloc(reinterpret_cast<void**>(&d_v), v_size));  // 分配 V 设备内存
+  CHECK_MACA(mcMalloc(reinterpret_cast<void**>(&d_o), o_size));  // 分配 O 设备内存
+
+  CHECK_MACA(mcMemcpy(d_q, h_q.data(), q_size, mcMemcpyHostToDevice));  // 拷贝 Q 到设备
+  CHECK_MACA(mcMemcpy(d_k, h_k.data(), k_size, mcMemcpyHostToDevice));  // 拷贝 K 到设备
+  CHECK_MACA(mcMemcpy(d_v, h_v.data(), v_size, mcMemcpyHostToDevice));  // 拷贝 V 到设备
+
+  dim3 grid(target_seq_len, query_heads, batch_size);  // 配置 grid 维度
+  int block_size = (head_dim + 31) / 32 * 32;  // 对齐到 32 的 block 大小
+  if (block_size < 32) {  // 保证最小为 32
+    block_size = 32;  // 设置最小 block 大小
+  }
+  if (block_size > 1024) {  // 避免超过硬件限制
+    block_size = 1024;  // 限制最大 block 大小
+  }
+
+  if constexpr (std::is_same<T, float>::value) {  // float 路径使用串行点积
+    flash_attention_kernel_float<<<grid, block_size>>>(  // 启动 float kernel
+        reinterpret_cast<const float*>(d_q),  // Q 指针转换
+        reinterpret_cast<const float*>(d_k),  // K 指针转换
+        reinterpret_cast<const float*>(d_v),  // V 指针转换
+        reinterpret_cast<float*>(d_o),  // O 指针转换
+        target_seq_len, src_seq_len,  // 序列长度参数
+        query_heads, kv_heads, head_dim,  // 头数与维度参数
+        is_causal);  // causal 标志
+  } else if constexpr (std::is_same<T, half>::value) {  // half 路径使用串行点积
+    flash_attention_kernel_half<<<grid, block_size>>>(  // 启动 half kernel
+        reinterpret_cast<const half*>(d_q),  // Q 指针转换
+        reinterpret_cast<const half*>(d_k),  // K 指针转换
+        reinterpret_cast<const half*>(d_v),  // V 指针转换
+        reinterpret_cast<half*>(d_o),  // O 指针转换
+        target_seq_len, src_seq_len,  // 序列长度参数
+        query_heads, kv_heads, head_dim,  // 头数与维度参数
+        is_causal);  // causal 标志
+  } else {  // 其他类型走通用并行归约
+    flash_attention_kernel<<<grid, block_size>>>(  // 启动通用 kernel
+        d_q, d_k, d_v, d_o,  // 设备端指针
+        target_seq_len, src_seq_len,  // 序列长度参数
+        query_heads, kv_heads, head_dim,  // 头数与维度参数
+        is_causal);  // causal 标志
+  }
+
+  CHECK_MACA(mcGetLastError());  // 检查 kernel 启动错误
+  CHECK_MACA(mcDeviceSynchronize());  // 同步等待 kernel 完成
+
+  CHECK_MACA(mcMemcpy(h_o.data(), d_o, o_size, mcMemcpyDeviceToHost));  // 拷贝输出到主机
+
+  CHECK_MACA(mcFree(d_q));  // 释放 Q 设备内存
+  CHECK_MACA(mcFree(d_k));  // 释放 K 设备内存
+  CHECK_MACA(mcFree(d_v));  // 释放 V 设备内存
+  CHECK_MACA(mcFree(d_o));  // 释放 O 设备内存
+}
+////////// 作业题2 沐曦 END //////////  // 标注作业题2的沐曦适配代码结束
 
 // *********************************************************************
 // Explicit Template Instantiations (REQUIRED FOR LINKING WITH TESTER.O)
